@@ -1,17 +1,18 @@
 """Janus Service Manager — Spawn, monitor, and proxy child MCP servers."""
 
-import asyncio
 import logging
 import subprocess
 import json
 import os
+import select
+import time
 import threading
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # Track running child server processes
 _children: dict[str, dict] = {}
+_children_lock = threading.Lock()
 
 
 class ServiceManager:
@@ -20,8 +21,8 @@ class ServiceManager:
     def __init__(self, config: dict):
         self.config = config
 
-    async def start_service(self, service_key: str) -> bool:
-        """Start a child MCP server as a subprocess."""
+    def start_service(self, service_key: str) -> bool:
+        """Start a child MCP server as a subprocess (blocking, runs in thread)."""
         svc_config = self.config.get(service_key)
         if not svc_config:
             logger.warning("No config for service '%s'", service_key)
@@ -33,7 +34,17 @@ class ServiceManager:
         args = list(definition.get("args", []))
         package = definition.get("package", "")
         if package:
-            args = args + [package]
+            # Insert package right after runner flags (e.g., -y)
+            # Find the first non-flag arg position
+            pkg_in_args = any(package in arg for arg in args)
+            if not pkg_in_args:
+                insert_at = 0
+                for i, arg in enumerate(args):
+                    if arg.startswith("-"):
+                        insert_at = i + 1
+                    else:
+                        break
+                args.insert(insert_at, package)
 
         # Build environment with auth tokens
         env = os.environ.copy()
@@ -44,29 +55,26 @@ class ServiceManager:
             if env_var and token:
                 env[env_var] = token
 
-        logger.info("Starting service '%s': %s %s", service_key, command, " ".join(args))
+        logger.info("Spawning '%s': %s %s", service_key, command, " ".join(args))
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                command,
-                *args,
+            proc = subprocess.Popen(
+                [command] + args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
-                limit=1024 * 1024,  # 1MB buffer
             )
+        except FileNotFoundError:
+            logger.error("Command not found for '%s': %s", service_key, command)
+            with _children_lock:
+                _children[service_key] = {"error": f"Command not found: {command}", "tools": [], "definition": definition}
+            return False
 
-            # Perform MCP handshake
-            async def _mcp_send(msg: dict) -> dict:
-                line = json.dumps(msg) + "\n"
-                proc.stdin.write(line.encode("utf-8"))
-                await proc.stdin.drain()
-                resp = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
-                return json.loads(resp.decode("utf-8"))
-
-            # Initialize
-            init_resp = await _mcp_send({
+        # MCP handshake
+        try:
+            # 1. Initialize
+            init_resp = self._send_sync(proc, {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
@@ -76,58 +84,75 @@ class ServiceManager:
                     "clientInfo": {"name": "janus-mcp", "version": "0.1.0"},
                 },
             })
-            if "error" in init_resp:
-                logger.error("Init failed for '%s': %s", service_key, init_resp["error"])
+            if not init_resp or "error" in init_resp:
+                err_msg = init_resp.get("error", "unknown") if init_resp else "no response"
+                logger.error("Init failed for '%s': %s", service_key, err_msg)
                 proc.terminate()
                 return False
 
-            # Send initialized notification
-            await _mcp_send({
+            # 2. Send initialized notification (no response expected)
+            self._send_sync(proc, {
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized",
-            })
+            }, expect_response=False)
 
-            # List tools
-            tools_resp = await _mcp_send({
+            # 3. List tools
+            tools_resp = self._send_sync(proc, {
                 "jsonrpc": "2.0",
                 "id": 2,
-                "method": "list_tools",
+                "method": "tools/list",
                 "params": {},
             })
+            tools = tools_resp.get("result", {}).get("tools", []) if tools_resp else []
 
-            tools = tools_resp.get("result", {}).get("tools", [])
+            with _children_lock:
+                _children[service_key] = {
+                    "proc": proc,
+                    "tools": tools,
+                    "definition": definition,
+                }
 
-            _children[service_key] = {
-                "proc": proc,
-                "tools": tools,
-                "definition": definition,
-            }
-
-            logger.info("Service '%s' connected with %d tools", service_key, len(tools))
+            logger.info("Connected '%s' (%d tools)", service_key, len(tools))
             return True
 
         except Exception as e:
-            logger.error("Failed to start service '%s': %s", service_key, e)
-            _children[service_key] = {
-                "error": str(e),
-                "tools": [],
-                "definition": definition,
-            }
+            logger.error("Failed to start '%s': %s", service_key, e)
+            with _children_lock:
+                _children[service_key] = {"error": str(e), "tools": [], "definition": definition}
             return False
+
+    def _send_sync(self, proc, msg: dict, expect_response: bool = True) -> dict | None:
+        """Send a JSON-RPC message to a child process and optionally read response."""
+        line = json.dumps(msg) + "\n"
+        proc.stdin.write(line.encode("utf-8"))
+        proc.stdin.flush()
+
+        if not expect_response:
+            return None
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            r, _, _ = select.select([proc.stdout], [], [], 0.5)
+            if r:
+                resp = proc.stdout.readline()
+                if resp:
+                    return json.loads(resp.decode("utf-8"))
+        return {"error": "timeout", "message": "No response from child server within 30s"}
 
     def list_all_tools(self) -> list[dict]:
         """Aggregate tools from all connected services with janus_ prefix."""
         aggregated = []
-        for key, child in _children.items():
-            if child.get("error"):
-                continue
-            for tool in child.get("tools", []):
-                prefixed = {
-                    "name": f"janus_{key}_{tool['name']}",
-                    "description": tool.get("description", ""),
-                    "inputSchema": tool.get("inputSchema", {}),
-                }
-                aggregated.append(prefixed)
+        with _children_lock:
+            for key, child in list(_children.items()):
+                if child.get("error"):
+                    continue
+                for tool in child.get("tools", []):
+                    prefixed = {
+                        "name": f"janus_{key}_{tool['name']}",
+                        "description": tool.get("description", ""),
+                        "inputSchema": tool.get("inputSchema", {}),
+                    }
+                    aggregated.append(prefixed)
         return aggregated
 
     def call_tool(self, name: str, arguments: dict) -> dict:
@@ -142,66 +167,48 @@ class ServiceManager:
         service_key = parts[1]
         child_tool_name = parts[2]
 
-        child = _children.get(service_key)
+        with _children_lock:
+            child = _children.get(service_key)
+
         if not child:
             return {"isError": True, "content": [{"type": "text", "text": f"Service '{service_key}' is not connected. Run `janus connect {service_key}` first."}]}
 
         if child.get("error"):
             return {"isError": True, "content": [{"type": "text", "text": f"Service '{service_key}' error: {child['error']}"}]}
 
-        # Send call_tool via the running subprocess's stdin/stdout
         try:
-            proc = child["proc"]
-            request = {
+            result = self._send_sync(child["proc"], {
                 "jsonrpc": "2.0",
                 "id": 3,
-                "method": "call_tool",
-                "params": {
-                    "name": child_tool_name,
-                    "arguments": arguments,
-                },
-            }
-
-            # Run in executor to not block the event loop
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(self._sync_call, proc, request)
-                result = future.result(timeout=120)
-
-            return result
-
+                "method": "tools/call",
+                "params": {"name": child_tool_name, "arguments": arguments},
+            })
+            return result or {"isError": True, "content": [{"type": "text", "text": "No response from child server"}]}
         except Exception as e:
             logger.error("Tool call failed for %s/%s: %s", service_key, child_tool_name, e)
             return {"isError": True, "content": [{"type": "text", "text": str(e)}]}
 
-    def _sync_call(self, proc, request: dict) -> dict:
-        """Synchronous MCP call to a child process."""
-        import json
-        line = json.dumps(request) + "\n"
-        proc.stdin.write(line.encode("utf-8"))
-        proc.stdin.flush()
-        resp = proc.stdout.readline()
-        return json.loads(resp.decode("utf-8")) if resp else {"isError": True, "content": [{"type": "text", "text": "No response from child server"}]}
-
     def stop_all(self):
         """Terminate all child server processes."""
-        for key, child in _children.items():
-            if "proc" in child:
-                try:
-                    child["proc"].terminate()
-                except Exception:
-                    pass
-        _children.clear()
+        with _children_lock:
+            for key, child in list(_children.items()):
+                if "proc" in child:
+                    try:
+                        child["proc"].terminate()
+                    except Exception:
+                        pass
+            _children.clear()
 
     def get_status(self) -> list[dict]:
         """Get status of all services."""
         statuses = []
-        for key, child in _children.items():
-            statuses.append({
-                "key": key,
-                "name": child.get("definition", {}).get("name", key),
-                "connected": "proc" in child and child["proc"].returncode is None,
-                "tools": len(child.get("tools", [])),
-                "error": child.get("error"),
-            })
+        with _children_lock:
+            for key, child in list(_children.items()):
+                statuses.append({
+                    "key": key,
+                    "name": child.get("definition", {}).get("name", key),
+                    "connected": "proc" in child and child["proc"].poll() is None,
+                    "tools": len(child.get("tools", [])),
+                    "error": child.get("error"),
+                })
         return statuses

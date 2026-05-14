@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "janus-mcp"
+version = "0.1.0"
+description = "Self-hosted MCP connector hub — aggregate, manage, and authenticate MCP servers under one namespace."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Duskript", email = "hello@duskript.com"},
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "pyyaml>=6.0",
+    "cryptography>=42.0.0",
+    "click>=8.0",
+]
+
+[project.scripts]
+janus = "janus.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["janus"]
